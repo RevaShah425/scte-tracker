@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <title>SCTE Tracker | NBA TV</title>
+  <meta
+    name="description"
+    content="Track NBA TV SCTE messages and progress toward a per-game target."
+  >
+</head>
+
+<body>
+  <header class="site-header">
+    <a class="brand" href="./">SCTE Tracker</a>
+    <p>NBA TV · Broadcast monitoring</p>
+    <span id="connection-status"> Not connected</span>
+  </header>
+
+  <main>
+    <!-- Game setup -->
+    <section class="game-panel" aria-labelledby="game-heading">
+      <h1 id="game-heading">Game tracker</h1>
+      <p>Count every SCTE message reported for NBAM during a game.</p>
+
+      <form id="game-form">
+        <div class="form-field">
+          <label for="game-name">Game name</label>
+          <input
+            id="game-name"
+            name="gameName"
+            type="text"
+            placeholder="Example: Knicks vs. Celtics"
+            maxlength="120"
+            required
+          >
+        </div>
+
+        <div class="form-field">
+          <label for="message-target">Message target</label>
+          <input
+            id="message-target"
+            name="messageTarget"
+            type="number"
+            value="96"
+            min="1"
+            max="10000"
+            step="1"
+            required
+          >
+        </div>
+
+        <button id="start-button" type="submit" disabled>
+          Start tracking
+        </button>
+      </form>
+
+      <p id="setup-notice">
+        Preview only. Tracking controls are not connected yet.
+      </p>
+    </section>
+
+    <!-- TV-shaped tracker: appearance comes in the CSS step -->
+    <section class="tracker-panel" aria-labelledby="tracker-heading">
+      <div class="tv-frame">
+        <div class="tv-screen">
+          <header class="screen-header">
+            <div>
+              <p class="eyebrow">NBA TV</p>
+              <h2 id="tracker-heading">NBAM</h2>
+            </div>
+            <span id="tracking-status">Not started</span>
+          </header>
+
+          <p id="active-game">No game selected</p>
+
+          <div class="count-display">
+            <span id="message-count">—</span>
+            <span class="count-divider">/</span>
+            <span id="target-count">96</span>
+          </div>
+          <p>SCTE messages this game</p>
+
+          <div class="progress-summary">
+            <span id="progress-percentage">Awaiting data</span>
+            <span id="remaining-count">Remaining: —</span>
+          </div>
+
+          <label for="target-progress">Progress toward game target</label>
+          <progress id="target-progress" max="96"></progress>
+
+          <!-- JavaScript will create one square per target message. -->
+          <div id="message-grid" aria-hidden="true"></div>
+
+          <p class="grid-legend">
+            One filled square represents one counted message.
+          </p>
+
+          <p id="target-status">
+            Counts will continue beyond the target.
+          </p>
+        </div>
+
+        <div class="tv-controls">
+          <button id="refresh-button" type="button" disabled>
+            Refresh count
+          </button>
+          <button id="end-button" type="button" disabled>
+            End tracking
+          </button>
+        </div>
+      </div>
+
+      <dl class="tracking-details">
+        <div>
+          <dt>Tracking started</dt>
+          <dd id="tracking-started">—</dd>
+        </div>
+        <div>
+          <dt>Last successful update</dt>
+          <dd id="last-updated">Never</dd>
+        </div>
+        <div>
+          <dt>Tracking ended</dt>
+          <dd id="tracking-ended">—</dd>
+        </div>
+      </dl>
+
+      <p id="update-message" role="status" aria-live="polite">
+        No data has been loaded.
+      </p>
+
+      <p id="error-message" role="alert" hidden></p>
+    </section>
+
+    <!-- Event history -->
+    <section class="events-panel" aria-labelledby="events-heading">
+      <h2 id="events-heading">Recent messages</h2>
+      <p>Individual events reported by the probe for the selected game.</p>
+
+      <div class="table-container">
+        <table>
+          <caption>NBAM SCTE event history · timestamps in UTC</caption>
+          <thead>
+            <tr>
+              <th scope="col">Received at</th>
+              <th scope="col">Record ID</th>
+              <th scope="col">Service</th>
+              <th scope="col">Details</th>
+            </tr>
+          </thead>
+          <tbody id="events-body">
+            <tr>
+              <td colspan="4">No messages loaded yet.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <p>SCTE Tracker · NBA TV</p>
+    <p>Counts reflect messages reported by the monitoring probe.</p>
+  </footer>
+</body>
+</html>
