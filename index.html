@@ -1,36 +1,76 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<link rel="stylesheet" href="styles.css">
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SCTE Tracker</title>
+  <link rel="stylesheet" href="styles.css">
 
-  <title>SCTE Tracker | NBA TV</title>
-  <meta
-    name="description"
-    content="Track NBA TV SCTE messages and progress toward a per-game target."
-  >
+  <style>
+    #stream-results {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 10px;
+      border: 1px solid #64748b;
+      border-radius: 8px;
+      background: #111827;
+      color: #f8fafc;
+      font: inherit;
+    }
+
+    #stream-results option {
+      padding: 6px;
+    }
+
+    #stream-source {
+      overflow-wrap: anywhere;
+    }
+
+    #target-progress[hidden] {
+      display: none;
+    }
+  </style>
 </head>
 
 <body>
   <header class="site-header">
     <a class="brand" href="./">SCTE Tracker</a>
-    <p>NBA TV · Broadcast monitoring</p>
-    <span id="connection-status"> Not connected</span>
+    <p>Broadcast monitoring</p>
+    <span id="connection-status">Not connected</span>
   </header>
 
   <main>
-    <!-- Game setup -->
     <section class="game-panel" aria-labelledby="game-heading">
       <h1 id="game-heading">Game tracker</h1>
-      <p>Count every SCTE message reported for NBAM during a game.</p>
+      <p>Select a stream to display its SCTE records.</p>
+
+      <div class="form-field">
+        <label for="stream-search">Stream name</label>
+        <input
+          id="stream-search"
+          type="search"
+          placeholder="Search stream names…"
+          autocomplete="off"
+          aria-controls="stream-results"
+        >
+      </div>
+
+      <div class="form-field">
+        <label for="stream-results">Matching streams</label>
+        <select id="stream-results" size="5"></select>
+      </div>
+
+      <p id="stream-source" role="status">Loading streams…</p>
+
+      <button id="reload-streams" type="button">
+        Reload stream list
+      </button>
 
       <form id="game-form">
         <div class="form-field">
           <label for="game-name">Game name</label>
           <input
             id="game-name"
-            name="gameName"
             type="text"
             placeholder="Example: Knicks vs. Celtics"
             maxlength="120"
@@ -39,16 +79,14 @@
         </div>
 
         <div class="form-field">
-          <label for="message-target">Message target</label>
+          <label for="message-target">Message target — optional</label>
           <input
             id="message-target"
-            name="messageTarget"
             type="number"
-            value="96"
+            placeholder="Target not assigned"
             min="1"
             max="10000"
             step="1"
-            required
           >
         </div>
 
@@ -57,31 +95,56 @@
         </button>
       </form>
 
-      <p id="setup-notice">
-        Preview only. Tracking controls are not connected yet.
-      </p>
+      <p id="setup-notice"></p>
     </section>
 
-    <!-- TV-shaped tracker: appearance comes in the CSS step -->
     <section class="tracker-panel" aria-labelledby="tracker-heading">
       <div class="tv-frame">
         <div class="tv-screen">
           <header class="screen-header">
             <div>
-              <p class="eyebrow">NBA TV</p>
-              <h2 id="tracker-heading">NBAM</h2>
+              <p class="eyebrow" id="stream-location">SCTE tracker</p>
+              <h2 id="tracker-heading">Select a stream</h2>
             </div>
             <span id="tracking-status">Not started</span>
           </header>
+
+          <div class="form-field">
+  <label for="time-range">Time range</label>
+
+  <select id="time-range">
+    <option value="15">Last 15 minutes</option>
+    <option value="30">Last 30 minutes</option>
+    <option value="60" selected>Last hour</option>
+    <option value="180">Last 3 hours</option>
+    <option value="custom">Custom time range</option>
+    <option value="game">Current game</option>
+  </select>
+</div>
+
+<div id="custom-time-fields" hidden>
+  <div class="form-field">
+    <label for="range-start">Start time — your local time</label>
+    <input id="range-start" type="datetime-local">
+  </div>
+
+  <div class="form-field">
+    <label for="range-end">End time — your local time</label>
+    <input id="range-end" type="datetime-local">
+  </div>
+</div>
+
+<p id="range-description"></p>
 
           <p id="active-game">No game selected</p>
 
           <div class="count-display">
             <span id="message-count">—</span>
             <span class="count-divider">/</span>
-            <span id="target-count">96</span>
+            <span id="target-count">—</span>
           </div>
-          <p>SCTE messages this game</p>
+
+          <p id="count-label">SCTE records</p>
 
           <div class="progress-summary">
             <span id="progress-percentage">Awaiting data</span>
@@ -89,18 +152,12 @@
           </div>
 
           <label for="target-progress">Progress toward game target</label>
-          <progress id="target-progress" max="96"></progress>
+          <progress id="target-progress" max="96" value="0"></progress>
 
-          <!-- JavaScript will create one square per target message. -->
           <div id="message-grid" aria-hidden="true"></div>
 
-          <p class="grid-legend">
-            One filled square represents one counted message.
-          </p>
-
-          <p id="target-status">
-            Counts will continue beyond the target.
-          </p>
+          <p class="grid-legend"></p>
+          <p id="target-status"></p>
         </div>
 
         <div class="tv-controls">
@@ -129,20 +186,21 @@
       </dl>
 
       <p id="update-message" role="status" aria-live="polite">
-        No data has been loaded.
+        No data loaded.
       </p>
 
       <p id="error-message" role="alert" hidden></p>
     </section>
 
-    <!-- Event history -->
     <section class="events-panel" aria-labelledby="events-heading">
       <h2 id="events-heading">Recent messages</h2>
-      <p>Individual events reported by the probe for the selected game.</p>
+      <p>Latest 50 exported records for the selected stream.</p>
 
       <div class="table-container">
         <table>
-          <caption>NBAM SCTE event history · timestamps in UTC</caption>
+          <caption id="events-caption">
+            SCTE event history · timestamps in UTC
+          </caption>
           <thead>
             <tr>
               <th scope="col">Received at</th>
@@ -153,7 +211,7 @@
           </thead>
           <tbody id="events-body">
             <tr>
-              <td colspan="4">No messages loaded yet.</td>
+              <td colspan="4">Select a stream.</td>
             </tr>
           </tbody>
         </table>
@@ -162,9 +220,10 @@
   </main>
 
   <footer class="site-footer">
-    <p>SCTE Tracker · NBA TV</p>
-    <p>Counts reflect messages reported by the monitoring probe.</p>
+    <p>SCTE Tracker</p>
+    <p>Counts reflect records reported by the monitoring probe.</p>
   </footer>
-  <script src="app.js" defer></script>
+
+  <script src="/app.js" defer></script>
 </body>
 </html>

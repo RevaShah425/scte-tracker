@@ -1,321 +1,734 @@
 "use strict";
 
-// UI prototype only. No requests are sent to the Bridge probe.
-// Demo state resets when the browser page is reloaded.
-
 const $ = (id) => document.getElementById(id);
+const STORAGE_KEY = "scte-stream-games-v2";
 
-const ui = {
-  form: $("game-form"),
-  gameName: $("game-name"),
-  targetInput: $("message-target"),
-  start: $("start-button"),
-  refresh: $("refresh-button"),
-  end: $("end-button"),
-  connection: $("connection-status"),
-  tracking: $("tracking-status"),
-  notice: $("setup-notice"),
-  activeGame: $("active-game"),
-  count: $("message-count"),
-  target: $("target-count"),
-  percentage: $("progress-percentage"),
-  remaining: $("remaining-count"),
-  progress: $("target-progress"),
-  grid: $("message-grid"),
-  targetStatus: $("target-status"),
-  started: $("tracking-started"),
-  updated: $("last-updated"),
-  ended: $("tracking-ended"),
-  message: $("update-message"),
-  error: $("error-message"),
-  events: $("events-body"),
-};
+let streams = [];
+let screenshotNames = [];
+let selected = null;
+let historyEvents = [];
+let fetchedAt = null;
+let loaded = false;
+let busy = false;
+let timer = null;
+let games = {};
 
-const state = {
-  phase: "idle",
-  gameName: "",
-  target: 96,
-  startedAt: null,
-  endedAt: null,
-  updatedAt: null,
-  events: [],
-  eventKeys: new Set(),
-  nextDemoId: 1,
-};
+try {
+  const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
 
-const dateFormat = new Intl.DateTimeFormat(undefined, {
-  month: "short",
-  day: "numeric",
-  hour: "2-digit",
-  minute: "2-digit",
-  second: "2-digit",
-  timeZoneName: "short",
-});
+  if (saved && typeof saved === "object" && !Array.isArray(saved)) {
+    games = saved;
+  }
+} catch {
+  games = {};
+}
 
-function formatDate(value) {
-  return value ? dateFormat.format(new Date(value)) : "—";
+function currentGame() {
+  if (!selected) return null;
+
+  const game = games[selected.key];
+
+  if (
+    !game ||
+    !Array.isArray(game.events) ||
+    !Number.isFinite(Date.parse(game.startedAt))
+  ) {
+    return null;
+  }
+
+  return game;
 }
 
 function showError(message = "") {
-  ui.error.textContent = message;
-  ui.error.hidden = !message;
+  $("error-message").textContent = message;
+  $("error-message").hidden = !message;
 }
 
 function announce(message) {
-  ui.message.textContent = message;
+  $("update-message").textContent = message;
 }
 
-// Create the target squares. A large future target is capped visually
-// at 96 tiles, while the numeric count and percentage stay exact.
-function renderGrid(count) {
-  const tileCount = Math.min(state.target, 96);
-  const filledCount = Math.floor(
-    (Math.min(count, state.target) / state.target) * tileCount
+function saveGames() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(games));
+  } catch {
+    showError(
+      "Browser storage is unavailable or full. Keep this page open to retain the current game."
+    );
+  }
+}
+
+function formatTime(value) {
+  if (value == null) return "—";
+  return new Date(value).toLocaleString();
+}
+
+function eventKey(event) {
+  return JSON.stringify([
+    event.tuningId,
+    event.serviceId,
+    event.raw?.pid,
+    event.recordId,
+    event.receivedAt,
+    event.scteEventId,
+    event.raw?.spliceCommand,
+    event.raw?.segmentationType,
+  ]);
+}
+
+function uniqueEvents(events) {
+  return [
+    ...new Map(
+      events.map((event) => [eventKey(event), event])
+    ).values(),
+  ].sort(
+    (a, b) => Date.parse(a.receivedAt) - Date.parse(b.receivedAt)
   );
+}
 
-  const fragment = document.createDocumentFragment();
+async function fetchJSON(url) {
+  const response = await fetch(url, {
+    cache: "no-store",
+    signal: AbortSignal.timeout(25000),
+  });
 
-  for (let index = 0; index < tileCount; index += 1) {
-    const tile = document.createElement("span");
+  const data = await response.json();
 
-    tile.className =
-      index < filledCount
-        ? "message-cell is-counted"
-        : "message-cell";
-
-    fragment.appendChild(tile);
+  if (!response.ok) {
+    throw new Error(data.error || `HTTP ${response.status}`);
   }
 
-  ui.grid.replaceChildren(fragment);
-
-  document.querySelector(".grid-legend").textContent =
-    state.target <= 96
-      ? "One filled square represents one counted message."
-      : "The 96-square grid shows proportional progress toward the target.";
+  return data;
 }
 
-function renderEvents() {
-  const fragment = document.createDocumentFragment();
+function renderOptions() {
+  const query = $("stream-search").value.trim().toLowerCase();
+  const list = $("stream-results");
 
-  if (state.events.length === 0) {
+  list.replaceChildren();
+
+  const liveNames = new Set(
+    streams.map((stream) => stream.streamName)
+  );
+
+  const matches = streams.filter((stream) =>
+    stream.streamName.toLowerCase().includes(query)
+  );
+
+  for (const stream of matches) {
+    const duplicate =
+      streams.filter(
+        (item) => item.streamName === stream.streamName
+      ).length > 1;
+
+    const label = duplicate
+      ? `${stream.streamName} (${stream.probeName})`
+      : stream.streamName;
+
+    list.add(new Option(label, stream.key));
+  }
+
+  for (const name of screenshotNames) {
+    if (
+      !name.toLowerCase().includes(query) ||
+      liveNames.has(name)
+    ) {
+      continue;
+    }
+
+    const option = new Option(`${name} — unavailable`, "");
+    option.disabled = true;
+    list.add(option);
+  }
+
+  list.value = selected?.key || "";
+
+  if (!selected) {
+    $("stream-source").textContent =
+      `${matches.length} selectable matches. ` +
+      "Unavailable streams were not returned by the probes.";
+  }
+}
+
+function getWindow() {
+  const mode = $("time-range").value;
+  const now = Date.now();
+
+  if (mode === "game") {
+    const game = currentGame();
+
+    if (!game) {
+      return {
+        valid: false,
+        label: "Current game",
+        message: "Start tracking a game for this stream first.",
+      };
+    }
+
+    return {
+      valid: true,
+      label: game.name,
+      start: Date.parse(game.startedAt),
+      end: game.endedAt ? Date.parse(game.endedAt) : now,
+      isGame: true,
+    };
+  }
+
+  if (mode === "custom") {
+    const start = new Date($("range-start").value).getTime();
+    const end = new Date($("range-end").value).getTime();
+
+    if (
+      !Number.isFinite(start) ||
+      !Number.isFinite(end) ||
+      end <= start
+    ) {
+      return {
+        valid: false,
+        label: "Custom time range",
+        message: "Choose a start and end time. End must be after start.",
+      };
+    }
+
+    if (end > now) {
+      return {
+        valid: false,
+        label: "Custom time range",
+        message: "Choose an end time that is not in the future.",
+      };
+    }
+
+    return {
+      valid: true,
+      label: "Custom time range",
+      start,
+      end,
+      isGame: false,
+    };
+  }
+
+  const minutes = Number(mode);
+
+  return {
+    valid: true,
+    label: {
+      15: "Last 15 minutes",
+      30: "Last 30 minutes",
+      60: "Last hour",
+      180: "Last 3 hours",
+    }[minutes],
+    start: now - minutes * 60 * 1000,
+    end: now,
+    isGame: false,
+  };
+}
+
+function getVisibleEvents(windowRange) {
+  if (!windowRange.valid) return [];
+
+  const game = currentGame();
+
+  // Saved game records can supplement the current probe history.
+  const source = windowRange.isGame
+    ? game.events
+    : uniqueEvents([
+        ...historyEvents,
+        ...(game?.events || []),
+      ]);
+
+  return source.filter((event) => {
+    const time = Date.parse(event.receivedAt);
+
+    return (
+      time >= windowRange.start &&
+      time <= windowRange.end
+    );
+  });
+}
+
+function renderEvents(events) {
+  const body = $("events-body");
+  body.replaceChildren();
+
+  $("events-caption").textContent =
+    `${selected?.streamName || "SCTE"} · selected time range · UTC`;
+
+  for (const event of events.slice(-50).reverse()) {
+    const row = document.createElement("tr");
+
+    for (const value of [
+      event.receivedAt,
+      event.recordId ?? "—",
+      event.serviceName ?? "Unknown",
+    ]) {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      row.appendChild(cell);
+    }
+
+    const cell = document.createElement("td");
+    const details = document.createElement("details");
+    const summary = document.createElement("summary");
+    const raw = document.createElement("pre");
+
+    summary.textContent = "View raw event";
+    raw.textContent = JSON.stringify(event.raw, null, 2);
+    raw.style.whiteSpace = "pre-wrap";
+    raw.style.overflowWrap = "anywhere";
+
+    details.append(summary, raw);
+    cell.appendChild(details);
+    row.appendChild(cell);
+    body.appendChild(row);
+  }
+
+  if (!events.length) {
     const row = document.createElement("tr");
     const cell = document.createElement("td");
 
     cell.colSpan = 4;
-    cell.textContent = "No messages counted in this demo game yet.";
+    cell.textContent = selected
+      ? "No available records in this time range."
+      : "Select a stream.";
+
     row.appendChild(cell);
-    fragment.appendChild(row);
-  } else {
-    // Keep the table compact; the total includes all demo events.
-    const recentEvents = state.events.slice(-20).reverse();
-
-    for (const event of recentEvents) {
-      const row = document.createElement("tr");
-      const values = [
-        event.receivedAt,
-        event.recordId,
-        event.service,
-        "Simulated SCTE message",
-      ];
-
-      for (const value of values) {
-        const cell = document.createElement("td");
-        cell.textContent = value;
-        row.appendChild(cell);
-      }
-
-      fragment.appendChild(row);
-    }
+    body.appendChild(row);
   }
-
-  ui.events.replaceChildren(fragment);
 }
 
 function render() {
-  const count = state.events.length;
-  const hasStarted = state.phase !== "idle";
-  const isActive = state.phase === "active";
-  const percent = (count / state.target) * 100;
+  const game = currentGame();
+  const active = Boolean(game && !game.endedAt);
+  const windowRange = getWindow();
+  const events = getVisibleEvents(windowRange);
+  const count = events.length;
 
-  ui.tracking.textContent = {
-    idle: "Demo · not started",
-    active: "Demo · tracking",
-    ended: "Demo · ended",
-  }[state.phase];
+  // A game target applies only to the game view.
+  const target = windowRange.isGame
+    ? game?.target || null
+    : null;
 
-  ui.activeGame.textContent = state.gameName || "No game selected";
-  ui.count.textContent = hasStarted ? count.toLocaleString() : "—";
-  ui.target.textContent = state.target.toLocaleString();
+  const hasData =
+    Boolean(selected) &&
+    windowRange.valid &&
+    (loaded || Boolean(windowRange.isGame && game));
 
-  ui.percentage.textContent = hasStarted
-    ? `${percent.toFixed(1)}% of target`
-    : "Awaiting demo game";
+  $("custom-time-fields").hidden =
+    $("time-range").value !== "custom";
 
-  ui.remaining.textContent = !hasStarted
-    ? "Remaining: —"
-    : count <= state.target
-      ? `${state.target - count} remaining`
-      : `${count - state.target} above target`;
+  $("tracker-heading").textContent =
+    selected?.streamName || "Select a stream";
 
-  ui.progress.max = state.target;
+  $("stream-location").textContent =
+    selected?.probeName || "SCTE tracker";
 
-  if (hasStarted) {
-    // The bar stops at 100%; the displayed count can exceed the target.
-    ui.progress.value = Math.min(count, state.target);
-  } else {
-    ui.progress.removeAttribute("value");
+  if (selected) {
+    $("stream-source").textContent =
+      `${selected.probeName} · ${selected.streamName}`;
   }
 
-  ui.targetStatus.textContent = !hasStarted
-    ? "Counts will continue beyond the target."
-    : count >= state.target
-      ? "Target reached. Additional messages still count."
-      : "Counting every simulated message, regardless of type.";
+  $("tracking-status").textContent = !selected
+    ? "Select a stream"
+    : active
+      ? "Game tracking · auto refresh"
+      : "Auto refresh · every 10 seconds";
 
-  ui.started.textContent = formatDate(state.startedAt);
-  ui.updated.textContent = state.updatedAt
-    ? `${formatDate(state.updatedAt)} · demo`
-    : "Never";
-  ui.ended.textContent = formatDate(state.endedAt);
+  $("active-game").textContent = windowRange.label;
 
-  ui.start.disabled = isActive;
-  ui.start.textContent =
-    state.phase === "ended" ? "Start new demo game" : "Start demo game";
+  $("count-label").textContent = windowRange.isGame
+    ? "SCTE records this game"
+    : `SCTE records · ${windowRange.label.toLowerCase()}`;
 
-  ui.refresh.disabled = !isActive;
-  ui.end.disabled = !isActive;
-  ui.gameName.disabled = isActive;
-  ui.targetInput.disabled = isActive;
+  $("message-count").textContent = hasData
+    ? count.toLocaleString()
+    : "—";
 
-  renderGrid(count);
-  renderEvents();
-}
+  $("target-count").textContent = target || "—";
 
-// Keep separate messages separate, but ignore repeated copies of
-// the same demo record. Live event identity will be handled by
-// the backend after we inspect the actual event response.
-function recordEvents(incomingEvents) {
-  let added = 0;
+  const divider = document.querySelector(".count-divider");
+  if (divider) divider.hidden = !target;
+  $("target-count").hidden = !target;
 
-  for (const event of incomingEvents) {
-    const key = `${event.source}:${event.recordId}`;
+  $("progress-percentage").textContent = target
+    ? `${((count / target) * 100).toFixed(1)}% of target`
+    : windowRange.label;
 
-    if (state.eventKeys.has(key)) {
-      continue;
+  $("remaining-count").textContent = target
+    ? count <= target
+      ? `${target - count} remaining`
+      : `${count - target} above target`
+    : "";
+
+  const progress = $("target-progress");
+  progress.max = target || 96;
+  progress.value = target ? Math.min(count, target) : 0;
+  progress.hidden = !target;
+
+  const progressLabel =
+    document.querySelector('label[for="target-progress"]');
+
+  if (progressLabel) progressLabel.hidden = !target;
+
+  const tiles = target ? Math.min(target, 96) : 96;
+  const filled = target
+    ? Math.floor((Math.min(count, target) / target) * tiles)
+    : Math.min(count, 96);
+
+  const fragment = document.createDocumentFragment();
+
+  for (let index = 0; index < tiles; index += 1) {
+    const tile = document.createElement("span");
+
+    tile.className =
+      "message-cell" +
+      (hasData && index < filled ? " is-counted" : "");
+
+    fragment.appendChild(tile);
+  }
+
+  $("message-grid").replaceChildren(fragment);
+
+  document.querySelector(".grid-legend").textContent =
+    target && target > 96
+      ? "The 96 squares show proportional progress toward the game target."
+      : !target
+        ? "One square per record, up to 96 visible squares. The number shows the full count."
+        : "One square per counted record.";
+
+  $("target-status").textContent = target
+    ? count >= target
+      ? "Game target reached. Additional records still count."
+      : "Counting records toward this game’s target."
+    : "Time-range count. No game target applied.";
+
+  $("range-description").textContent = !windowRange.valid
+    ? windowRange.message
+    : `${formatTime(windowRange.start)} → ${formatTime(windowRange.end)}`;
+
+  // A timestamp filter cannot recover history the probe no longer retains.
+  if (
+    windowRange.valid &&
+    !windowRange.isGame &&
+    loaded &&
+    historyEvents.length
+  ) {
+    const earliest = Date.parse(historyEvents[0].receivedAt);
+
+    if (earliest > windowRange.start) {
+      $("range-description").textContent +=
+        " · Available history starts later than this window; older records may be unavailable.";
     }
-
-    state.eventKeys.add(key);
-    state.events.push(event);
-    added += 1;
   }
 
-  return added;
+  $("tracking-started").textContent =
+    formatTime(game?.startedAt);
+
+  $("tracking-ended").textContent =
+    formatTime(game?.endedAt);
+
+  $("last-updated").textContent =
+    formatTime(fetchedAt || game?.fetchedAt);
+
+  $("start-button").disabled = busy || !selected || active;
+  $("start-button").textContent = game
+    ? "Start new game"
+    : "Start tracking";
+
+  $("refresh-button").disabled = busy || !selected;
+  $("end-button").disabled = busy || !active;
+
+  for (const id of ["game-name", "message-target"]) {
+    $(id).disabled = busy || active;
+  }
+
+  for (const id of [
+    "stream-search",
+    "stream-results",
+    "reload-streams",
+  ]) {
+    $(id).disabled = busy;
+  }
+
+  $("setup-notice").textContent =
+    "The selected stream refreshes every 10 seconds while this page is open. " +
+    "Game counts are saved separately per stream.";
+
+  renderEvents(events);
 }
 
-function startGame(event) {
-  event.preventDefault();
+async function getSelectedEvents() {
+  const data = await fetchJSON(
+    "/api/events?stream=" + encodeURIComponent(selected.key)
+  );
+
+  if (
+    data.streamKey !== selected.key ||
+    !Array.isArray(data.events) ||
+    !Number.isFinite(Date.parse(data.fetchedAt))
+  ) {
+    throw new Error(
+      "Unexpected stream response. No records were counted."
+    );
+  }
+
+  return data;
+}
+
+function mergeEvents(data) {
+  let invalid = 0;
+
+  const valid = data.events.filter((event) => {
+    const okay = Number.isFinite(Date.parse(event.receivedAt));
+    if (!okay) invalid += 1;
+    return okay;
+  });
+
+  // Preserve the returned history even while tracking a game,
+  // so the time-range selector can display either view.
+  historyEvents = uniqueEvents(valid);
+  fetchedAt = data.fetchedAt;
+  loaded = true;
+
+  const game = currentGame();
+
+  if (game) {
+    const start = Date.parse(game.startedAt);
+    const end = game.endedAt
+      ? Date.parse(game.endedAt)
+      : Infinity;
+
+    const gameEvents = valid.filter((event) => {
+      const time = Date.parse(event.receivedAt);
+      return time >= start && time <= end;
+    });
+
+    game.events = uniqueEvents([
+      ...game.events,
+      ...gameEvents,
+    ]);
+
+    game.fetchedAt = data.fetchedAt;
+    saveGames();
+  }
+
+  $("connection-status").textContent = "Bridge connected";
+
+  announce(
+    "Updated selected stream. The grid shows only the selected time range." +
+      (invalid
+        ? ` ${invalid} records with invalid timestamps were skipped.`
+        : "")
+  );
+}
+
+function scheduleRefresh() {
+  clearTimeout(timer);
+
+  if (selected) {
+    timer = setTimeout(() => {
+      runRequest(async () => {
+        mergeEvents(await getSelectedEvents());
+      });
+    }, 10000);
+  }
+}
+
+async function runRequest(action) {
+  if (busy) return;
+
+  clearTimeout(timer);
+  busy = true;
   showError();
 
-  const name = ui.gameName.value.trim();
-  const target = Number(ui.targetInput.value);
+  $("connection-status").textContent = "Requesting data…";
+  render();
 
-  if (!name) {
-    showError("Enter a game name.");
-    ui.gameName.focus();
+  try {
+    await action();
+  } catch (error) {
+    showError(error.message);
+
+    $("connection-status").textContent = "Update failed";
+
+    announce(
+      "Update failed. Showing retained records; the count may be incomplete."
+    );
+  } finally {
+    busy = false;
+    render();
+    scheduleRefresh();
+  }
+}
+
+async function loadStreams() {
+  const data = await fetchJSON("/api/streams");
+
+  if (!Array.isArray(data.streams)) {
+    throw new Error("The server returned an invalid stream list.");
+  }
+
+  streams = data.streams.sort((a, b) =>
+    a.streamName.localeCompare(
+      b.streamName,
+      undefined,
+      { numeric: true }
+    )
+  );
+
+  if (
+    selected &&
+    !streams.some((stream) => stream.key === selected.key)
+  ) {
+    selected = null;
+    historyEvents = [];
+    loaded = false;
+    fetchedAt = null;
+  }
+
+  renderOptions();
+
+  if (data.warnings?.length) {
+    showError(data.warnings.join(" | "));
+  }
+
+  $("connection-status").textContent = streams.length
+    ? "Stream list loaded"
+    : "No live streams found";
+}
+
+$("stream-search").addEventListener("input", renderOptions);
+
+$("stream-results").addEventListener("change", () => {
+  runRequest(async () => {
+    selected =
+      streams.find(
+        (stream) => stream.key === $("stream-results").value
+      ) || null;
+
+    historyEvents = [];
+    loaded = false;
+    fetchedAt = null;
+
+    $("game-name").value = currentGame()?.name || "";
+    $("message-target").value = currentGame()?.target || "";
+
+    if (
+      $("time-range").value === "game" &&
+      !currentGame()
+    ) {
+      $("time-range").value = "60";
+    }
+
+    if (selected) {
+      mergeEvents(await getSelectedEvents());
+    }
+  });
+});
+
+$("reload-streams").addEventListener("click", () => {
+  runRequest(loadStreams);
+});
+
+$("refresh-button").addEventListener("click", () => {
+  runRequest(async () => {
+    mergeEvents(await getSelectedEvents());
+  });
+});
+
+for (const id of ["time-range", "range-start", "range-end"]) {
+  $(id).addEventListener("change", render);
+}
+
+$("game-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+
+  const existing = currentGame();
+
+  if (
+    busy ||
+    !selected ||
+    (existing && !existing.endedAt)
+  ) {
     return;
   }
 
-  if (!Number.isInteger(target) || target < 1 || target > 10000) {
-    showError("Enter a whole-number target between 1 and 10,000.");
-    ui.targetInput.focus();
+  const name = $("game-name").value.trim();
+  const rawTarget = $("message-target").value;
+  const target = rawTarget === "" ? null : Number(rawTarget);
+
+  if (
+    !name ||
+    (target !== null &&
+      (!Number.isInteger(target) || target < 1 || target > 10000))
+  ) {
+    showError(
+      "Enter a game name and, optionally, a whole-number target from 1 to 10,000."
+    );
     return;
   }
 
   if (
-    state.phase === "ended" &&
+    existing &&
     !window.confirm(
-      "Start a new demo game? This clears the previous demo's messages."
+      "Replace this stream’s previous game with a new game?"
     )
   ) {
     return;
   }
 
-  state.phase = "active";
-  state.gameName = name;
-  state.target = target;
-  state.startedAt = new Date().toISOString();
-  state.endedAt = null;
-  state.updatedAt = null;
-  state.events = [];
-  state.eventKeys = new Set();
-  state.nextDemoId = 1;
+  const startedAt = new Date().toISOString();
 
-  render();
-  announce(
-    "Demo game started. Click Simulate refresh to add sample messages."
-  );
-}
+  runRequest(async () => {
+    const data = await getSelectedEvents();
 
-function simulateRefresh() {
-  if (state.phase !== "active") {
-    return;
-  }
+    games[selected.key] = {
+      name,
+      target,
+      startedAt,
+      endedAt: null,
+      fetchedAt: null,
+      events: [],
+    };
 
-  showError();
+    $("time-range").value = "game";
+    mergeEvents(data);
 
-  const receivedAt = new Date().toISOString();
+    announce(
+      "Game started. Earlier records are excluded. Refreshing every 10 seconds."
+    );
+  });
+});
 
-  // Exactly four synthetic messages per click, for predictable testing.
-  const newEvents = Array.from({ length: 4 }, () => ({
-    source: "demo-nbam",
-    recordId: `DEMO-${state.nextDemoId++}`,
-    service: "NBAM",
-    receivedAt,
-  }));
+$("end-button").addEventListener("click", () => {
+  const game = currentGame();
 
-  // Include prior records to mimic overlapping API responses.
-  // recordEvents() must not count those prior records again.
-  const response = [
-    ...state.events.slice(-4),
-    ...newEvents,
-  ];
+  if (busy || !game || game.endedAt) return;
 
-  const added = recordEvents(response);
-  state.updatedAt = receivedAt;
+  game.endedAt = new Date().toISOString();
+  saveGames();
 
-  render();
-  announce(
-    `Demo updated: ${added} new messages. ` +
-    `${state.events.length} counted in this game.`
-  );
-}
+  runRequest(async () => {
+    mergeEvents(await getSelectedEvents());
+  });
+});
 
-function endGame() {
-  if (state.phase !== "active") {
-    return;
-  }
-
-  state.phase = "ended";
-  state.endedAt = new Date().toISOString();
-
-  render();
-  announce(
-    `Demo game ended with ${state.events.length} messages ` +
-    `against a target of ${state.target}.`
-  );
-}
-
-// Label demo behavior explicitly.
-ui.connection.textContent = "Demo · no probe connection";
-ui.notice.textContent =
-  "Demo only. Simulate refresh adds four sample messages. " +
-  "Reloading the page clears demo data.";
-
-ui.refresh.textContent = "Simulate refresh +4";
-ui.end.textContent = "End demo game";
-
-ui.form.addEventListener("submit", startGame);
-ui.refresh.addEventListener("click", simulateRefresh);
-ui.end.addEventListener("click", endGame);
+// Keep rolling windows moving even between successful fetches.
+setInterval(() => {
+  if (selected && !busy) render();
+}, 1000);
 
 render();
+
+runRequest(async () => {
+  try {
+    const names = await fetchJSON("/streams.json");
+
+    screenshotNames = Array.isArray(names)
+      ? names.filter((name) => typeof name === "string")
+      : [];
+  } catch {
+    screenshotNames = [];
+  }
+
+  await loadStreams();
+});

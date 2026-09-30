@@ -1,0 +1,27 @@
+{
+  "name": "scte-tracker",
+  "version": "1.0.0",
+  "description": "A web dashboard for tracking SCTE-35 messages during NBA games using data from a Bridge Technologies VB330 probe.",
+  "main": "app.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RevaShah425/scte-tracker.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/RevaShah425/scte-tracker/issues"
+  },
+  "homepage": "https://github.com/RevaShah425/scte-tracker#readme",
+  "dependencies": {
+    "dotenv": "^18.0.4",
+    "express": "^5.2.1",
+    "fast-xml-parser": "^5.11.2",
+    "undici": "^8.11.2"
+  }
+}
